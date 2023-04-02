@@ -553,6 +553,170 @@ def summary_flow(
 
     return summaries, summary_by_aid
 
+@task
+def write_details(
+    df: pd.DataFrame,
+    pnl: pd.DataFrame,
+    pos: pd.DataFrame,
+    trd: pd.DataFrame,
+    trBySym: Dict[str, int],
+    pnlBySym: Dict[str, float],
+    trByMon: Dict[str, int],
+    pnlByMon: Dict[str, float],
+    filename: Path) -> bool:
+
+    logger = get_run_logger()
+
+    def style_negative(v, props=""):
+        if pd.isna(v) or isinstance(v, str):
+            return None
+        return props if v < 0 else None
+
+    logger.info(f"Writing to detail file {filename} ...")
+    with pd.ExcelWriter(filename, engine="xlsxwriter") as writer:
+        df_symbols = pd.DataFrame({"Symbol": sorted(pos.columns.to_list())})
+        df_symbols.to_excel(writer, sheet_name="universe", index=False)
+        df.T.to_excel(writer, sheet_name="stats", index=True)
+        pos.to_excel(writer, sheet_name="portfolio", index=True, startrow=0)
+        trd.to_excel(writer, sheet_name="trades", index=True, startrow=0)
+
+        df_trade_coin = pd.Series(trBySym, dtype=np.int64)
+        df_trade_coin.index.name = "Symbol"
+        df_pnl_coin = pd.Series(pnlBySym, dtype=np.float32)
+        df_pnl_coin.index.name = "Symbol"
+        df_coin = pd.DataFrame({"Count": df_trade_coin, "Total PnL": df_pnl_coin})
+        df_coin["Averge PnL"] = df_coin["Total PnL"].div(df_coin["Count"])
+        df_coin.sort_index(inplace=True)
+        ds_coin = df_coin.style.applymap(style_negative, props="color:red;")
+        ds_coin.to_excel(writer, sheet_name="PnL Coin", index=True)
+
+        months, counts, pnls = [], [], []
+        for mon in sorted(trByMon):
+            months += mon,
+            counts += trByMon[mon],
+            pnls += pnlByMon[mon],
+
+        df_month = pd.DataFrame({"Month": months, "Count": counts, "Total PnL": pnls})
+        df_month["Average PnL"] = df_month["Total PnL"].div(df_month["Count"])
+        ds_month = df_month.style.applymap(style_negative, props="color:red;")
+        ds_month.to_excel(writer, sheet_name="PnL Month", index=True)
+
+    return True
+
+@flow(task_runner=ConcurrentTaskRunner(), flow_run_name="detail")
+def detail_flow(
+    summary_details: Dict[str, Any],
+    pnls: Dict[str, Any],
+    positions: Dict[str, Any],
+    trades: Dict[str, Any],
+    tradesBySymbol: Dict[str, Any],
+    pnlBySymbol: Dict[str, Any],
+    tradesByMonth: Dict[str, Any],
+    pnlByMonth: Dict[str, Any],
+    output: str):
+
+    logger = get_run_logger()
+
+    details = defaultdict(lambda: defaultdict(pd.DataFrame))
+    detail_wait = defaultdict(lambda: defaultdict(pd.DataFrame))
+
+    output = Path(output)
+
+    for alpha_id in sorted(summary_details):
+        output_dir = output / alpha_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for param in summary_details[alpha_id]:
+            filename = create_output_filename(alpha_id, param, ".xlsx")
+            filename = output_dir / filename
+            filename.unlink(missing_ok=True)
+
+            df = summary_details[alpha_id][param]
+            pnl = pnls[alpha_id][param]['N'].sum(axis=1, skipna=True)
+            pos = positions[alpha_id][param]
+            trd = trades[alpha_id][param]
+            trBySym  = tradesBySymbol[alpha_id][param]
+            pnlBySym = pnlBySymbol[alpha_id][param]
+            trByMon  = tradesByMonth[alpha_id][param]
+            pnlByMon = pnlByMonth[alpha_id][param]
+
+            fut = write_details.submit(df, pnl, pos, trd, trBySym, pnlBySym, trByMon, pnlByMon, filename)
+            detail_wait[alpha_id][param] = fut
+
+    for alpha_id in sorted(detail_wait):
+        for param in detail_wait[alpha_id]:
+            res = detail_wait[alpha_id][param].wait().result()
+            if not res: logger.info(f"Written {alpha_id} {param} details failed!")
+
+    logger.info("Detail writing is done!")
+
+@task
+def plotting(pnls: Dict[str, Any], pos: pd.DataFrame, filename: Path) -> bool:
+    t_pnl = pnls['T'].sum(axis=1)
+    n_pnl = pnls['N'].sum(axis=1)
+    l_pnl = pnls['L'].sum(axis=1)
+    s_pnl = pnls['S'].sum(axis=1)
+
+    import matplotlib
+    matplotlib.use("agg")
+
+    fig, axes = plt.subplots(3, 1, figsize=(20, 20), sharex="col")
+
+    axes[0].plot(t_pnl.cumsum(), label="Total", linewidth=3)
+    axes[0].plot(n_pnl.cumsum(), label="Net", linewidth=3)
+    axes[0].plot(l_pnl.cumsum(), label="Long", linewidth=3)
+    axes[0].plot(s_pnl.cumsum(), label="Short", linewidth=3)
+    axes[0].legend(prop=dict(size=18))
+    axes[1].plot(t_pnl, label="Tot", linewidth=2.5)
+    axes[1].plot(n_pnl, label="Net", linewidth=2.5)
+    axes[1].legend(prop=dict(size=18))
+    axes[2].plot(pos.abs().sum(axis=1), label="Position", linewidth=3.5)
+    axes[2].legend(prop=dict(size=18))
+
+    axes[0].grid()
+    axes[1].grid()
+    axes[2].grid()
+
+    axes[0].tick_params(axis='x', labelsize=24)
+    axes[1].tick_params(axis='x', labelsize=24)
+    axes[2].tick_params(axis='x', labelsize=24)
+
+    axes[0].tick_params(axis='y', labelsize=24)
+    axes[1].tick_params(axis='y', labelsize=24)
+    axes[2].tick_params(axis='y', labelsize=24)
+
+    fig.savefig(filename)
+    plt.close(fig)
+    return True
+
+@flow(task_runner=ConcurrentTaskRunner(), flow_run_name="plot")
+def plot_flow(pnls: Dict[str, Any], positions: Dict[str, Any], output: str):
+    logger = get_run_logger()
+
+    plots = defaultdict(lambda: defaultdict(pd.DataFrame))
+    plot_wait = defaultdict(lambda: defaultdict(pd.DataFrame))
+
+    output = Path(output)
+
+    for alpha_id in sorted(pnls):
+        output_dir = output / alpha_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for param in pnls[alpha_id]:
+            filename = create_output_filename(alpha_id, param, ".jpg")
+            filename = output_dir / filename
+            filename.unlink(missing_ok=True)
+
+            pnl = pnls[alpha_id][param]
+            pos = positions[alpha_id][param]
+
+            fut = plotting.submit(pnl, pos, filename)
+            plot_wait[alpha_id][param] = fut
+
+    for alpha_id in sorted(plot_wait):
+        for param in plot_wait[alpha_id]:
+            res = plot_wait[alpha_id][param].wait().result()
+            if not res: logger.info(f"Saving {alpha_id} {param} plots failed!")
+
+    logger.info(f"Plots saving done!")
 
 
 @flow(task_runner=ConcurrentTaskRunner(), flow_run_name="sim")
@@ -574,6 +738,8 @@ def sim_flow(data_dir: str,
     trades = trade_flow(pnls, positions)
     winTrades, lossTrades, winPnL, lossPnL, tradesBySymbol, pnlBySymbol, tradesByMonth, pnlByMonth = count_trades_flow(trades)
     summaries, summary_by_aid = summary_flow(pnls, positions, winTrades, lossTrades, winPnL, lossPnL, freq, start, end, output)
+    detail_flow(summaries, pnls, positions, trades, tradesBySymbol, pnlBySymbol, tradesByMonth, pnlByMonth, output)
+    plot_flow(pnls, positions, output)
 
     return data, signals, positions, slippage, pnls, trades, \
         winTrades, lossTrades, winPnL, lossPnL, tradesBySymbol, pnlBySymbol, tradesByMonth, pnlByMonth, \
