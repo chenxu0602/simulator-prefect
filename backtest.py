@@ -210,7 +210,7 @@ def pos_flow(signals: Dict[str, Any], delay: int = 0):
     return positions
 
 @task
-def calc_slippage(data: Any, pos: pd.DataFrame, rate: float = 5e-4) -> Dict[str, pd.DataFrame]:
+def calc_slippage(data: Any, pos: pd.DataFrame, rate: float) -> Dict[str, pd.DataFrame]:
     posL = copy.deepcopy(pos)
     posS = copy.deepcopy(pos)
     posL[posL < 0] = 0
@@ -223,14 +223,14 @@ def calc_slippage(data: Any, pos: pd.DataFrame, rate: float = 5e-4) -> Dict[str,
     return {'T': t, 'L': l, 'S': s} 
 
 @flow(task_runner=ConcurrentTaskRunner(), flow_run_name="slip")
-def slip_flow(data: Any, positions: Dict[str, Any]) -> Dict[str, Any]:
+def slip_flow(data: Any, positions: Dict[str, Any], rate: float) -> Dict[str, Any]:
     slip = defaultdict(lambda: defaultdict(lambda: defaultdict(pd.DataFrame)))
     slip_wait = defaultdict(lambda: defaultdict(pd.DataFrame))
 
     for alpha_id in sorted(positions):
         for param in positions[alpha_id]:
             pos = positions[alpha_id][param]
-            fut = calc_slippage.submit(data, pos)
+            fut = calc_slippage.submit(data, pos, rate)
             slip_wait[alpha_id][param] = fut
 
     for alpha_id in sorted(slip_wait):
@@ -278,7 +278,8 @@ def calc_trades(pnls: Dict[str, Any], pos: pd.DataFrame) -> pd.DataFrame:
     if pos.empty: return pd.DataFrame()
 
     df_trd = pd.DataFrame(index=pos.index, columns=pos.columns, dtype=np.str_)
-    ppos = pos.shift(1)
+    ppos = pos.shift(2)
+    pos = pos.shift(1)
     pchg = (pos - ppos).div(ppos.abs() + pos.abs()) * 2.0
     chg_thr = 0.05
 
@@ -290,12 +291,12 @@ def calc_trades(pnls: Dict[str, Any], pos: pd.DataFrame) -> pd.DataFrame:
     df_trd[(ppos < 0) & (pos == 0)] = "Short Close"
     df_trd[(ppos > 0) & (pos > 0) & (pchg >= chg_thr)]  = "Long Incr"
     df_trd[(ppos > 0) & (pos > 0) & (pchg <= -chg_thr)] = "Long Decr"
-    df_trd[(ppos < 0) & (pos < 0) & (pchg <= -chg_thr)] = "Short Decr"
+    df_trd[(ppos < 0) & (pos < 0) & (pchg <= -chg_thr)] = "Short Incr"
     df_trd[(ppos < 0) & (pos < 0) & (pchg >= chg_thr)]  = "Short Decr"
 
     df_trd.columns = pd.MultiIndex.from_arrays([df_trd.columns, ["trades"] * len(df_trd.columns)])
 
-    df_pnl = copy.deepcopy(pnls['N'])
+    df_pnl = copy.deepcopy(pnls['T'])
     df_pnl.columns = pd.MultiIndex.from_arrays([df_pnl.columns, ["pnl"] * len(df_pnl.columns)])
 
     df_tmp = pd.concat([df_trd, df_pnl], axis=1)
@@ -726,6 +727,7 @@ def sim_flow(data_dir: str,
              end: str,
              freq: str,
              exec: str,
+             slip: float,
              config: str,
              output: str):
     
@@ -733,7 +735,7 @@ def sim_flow(data_dir: str,
     data = data_flow(data_dir, univ_file, start, end, freq)
     signals = talib_flow(data, config)
     positions = pos_flow(signals, delay=0)
-    slippage = slip_flow(data, positions)
+    slippage = slip_flow(data, positions, slip)
     pnls = pnl_flow(data, positions, slippage)
     trades = trade_flow(pnls, positions)
     winTrades, lossTrades, winPnL, lossPnL, tradesBySymbol, pnlBySymbol, tradesByMonth, pnlByMonth = count_trades_flow(trades)
@@ -757,5 +759,6 @@ if __name__ == "__main__":
         end="2023-01-01", 
         freq="15T",
         exec="close",
+        slip=1e-4,
         config="talib.json",
         output="Test")
