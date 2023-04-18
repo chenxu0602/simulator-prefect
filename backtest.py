@@ -8,7 +8,7 @@ from pathlib import Path
 from prefect.task_runners import SequentialTaskRunner, ConcurrentTaskRunner
 from collections import defaultdict, Counter
 import json, re, copy, string
-import talib_signals
+import talib_signals, mvavg_signals, alpha101_signals
 from random import randint 
 import matplotlib.pyplot as plt
 
@@ -129,13 +129,13 @@ def resample(df: pd.DataFrame,
     df_res = pd.concat([res[k] for k in columns], keys=columns, axis=1)
     return df_res
 
-@flow(task_runner=SequentialTaskRunner(), flow_run_name="data")
+@flow(task_runner=ConcurrentTaskRunner(), flow_run_name="data")
 def data_flow(data_dir: str, univ_file: str, start: str, end: str, freq: str):
     results, symbols = {}, []
     with open(univ_file, 'r') as f:
         for line in f:
             sym = line.strip('\n').strip('')
-            symbols.append(sym)
+            if not sym == "": symbols.append(sym)
 
     logger = get_run_logger()
     logger.info("Universe: {}".format(', '.join(symbols)))
@@ -187,19 +187,93 @@ def talib_flow(data: Any, config: str) -> pd.DataFrame:
 
     return signals
 
+@flow(task_runner=ConcurrentTaskRunner(), flow_run_name="mvavg")
+def mvavg_flow(data: Any, config: str) -> pd.DataFrame:
+    logger = get_run_logger()
+    logger.info("Generate MV-AVG signals ...")
+
+    params, combs = load_params(config)
+
+    signals = defaultdict(lambda: defaultdict(pd.DataFrame))
+    signal_wait = defaultdict(lambda: defaultdict(pd.DataFrame))
+
+    for alpha_id in sorted(params):
+        for param in params[alpha_id]:
+            func = getattr(mvavg_signals, alpha_id)
+            fut = func.submit(data, param)
+            signal_wait[alpha_id][frozenset(param.items())] = fut
+
+    for alpha_id in sorted(signal_wait):
+        for param in signal_wait[alpha_id]:
+            sig = signal_wait[alpha_id][param].wait().result()
+            signals[alpha_id][param] = sig
+
+    return signals
+
+@flow(task_runner=ConcurrentTaskRunner(), flow_run_name="alpha101")
+def alpha101_flow(data: Any, config: str) -> pd.DataFrame:
+    logger = get_run_logger()
+    logger.info("Generate Alpha101 signals ...")
+
+    params, combs = load_params(config)
+
+    signals = defaultdict(lambda: defaultdict(pd.DataFrame))
+    signal_wait = defaultdict(lambda: defaultdict(pd.DataFrame))
+
+    for alpha_id in sorted(params):
+        for param in params[alpha_id]:
+            func = getattr(alpha101_signals, alpha_id)
+            fut = func.submit(data, param)
+            signal_wait[alpha_id][frozenset(param.items())] = fut
+
+    for alpha_id in sorted(signal_wait):
+        for param in signal_wait[alpha_id]:
+            sig = signal_wait[alpha_id][param].wait().result()
+            signals[alpha_id][param] = sig
+
+    return signals
+
 @task
-def calc_positions(sig: pd.DataFrame, delay: int = 0, max_pos: float = 1.0) -> pd.DataFrame:
-    return sig.shift(delay) * max_pos
+def calc_positions(
+    sig: pd.DataFrame, 
+    df_univ: pd.DataFrame, 
+    delay: int = 0, 
+    max_pos: float = 1.0) -> pd.DataFrame:
+
+    pos = sig.shift(delay) * max_pos / len(df_univ) # Equal weight
+
+    months = sorted(df_univ.columns)
+    symbols = set(pos.columns)
+
+    n = len(months)
+
+    start = months[0] + " 00:00:00"
+    pos.loc[pos.index < start] = 0.
+
+    for i in range(n):
+        cur_mon = months[i]
+        nxt_mon = months[i + 1] if i + 1 < n else "2099-01-01"
+
+        start = f"{cur_mon} 00:00:00"
+        end = f"{nxt_mon} 00:00:00"
+
+        univ = set(df_univ[cur_mon].values)
+        for sym in symbols:
+            if not sym in univ:
+                pos.loc[(pos.index >= start) & (pos.index < end), sym] = 0.
+
+    return pos
+
 
 @flow(task_runner=ConcurrentTaskRunner(), flow_run_name="position")
-def pos_flow(signals: Dict[str, Any], delay: int = 0):
+def pos_flow(signals: Dict[str, Any], df_univ, delay: int = 0):
     positions = defaultdict(lambda: defaultdict(pd.DataFrame))
     position_wait = defaultdict(lambda: defaultdict(pd.DataFrame))
 
     for alpha_id in sorted(signals):
         for param in signals[alpha_id]:
             sig = signals[alpha_id][param]
-            fut = calc_positions.submit(sig, 0)
+            fut = calc_positions.submit(sig, df_univ, 0)
             position_wait[alpha_id][param] = fut
 
     for alpha_id in sorted(position_wait):
@@ -252,7 +326,8 @@ def calc_pnls(data: Any, pos: pd.DataFrame, slip: Any) -> Dict[str, pd.DataFrame
     pnlL = ret.mul(posL.shift(1))
     pnlS = ret.mul(posS.shift(1))
 
-    return {'T': pnl, 'N': pnl + slip['T'], 'L': pnlL + slip['L'], 'S': pnlS + slip['S']}
+    # return {'T': pnl, 'N': pnl + slip['T'], 'L': pnlL + slip['L'], 'S': pnlS + slip['S']}
+    return {'T': pnl, 'N': pnl + slip['T'], 'L': pnlL, 'S': pnlS}
 
 @flow(task_runner=ConcurrentTaskRunner(), flow_run_name="pnl")
 def pnl_flow(data: Any, positions: Dict[str, Any], slippage: Any) -> Dict[str, Any]:
@@ -408,11 +483,12 @@ def count_trades_flow(trades: Dict[str, Any]) -> Dict[str, Any]:
 def calc_tvr(pos: pd.DataFrame, day_factor: float) -> float:
     return pos.diff().abs().sum(axis=1).mean() / pos.abs().sum(axis=1).mean() * day_factor
 
-def calc_tvr2(pos: pd.DataFrame, day_factor: float) -> float:
-    return pos.diff().abs().sum(axis=1).mean() / len(pos.columns) * day_factor
+def calc_tvr2(df_univ: pd.DataFrame, pos: pd.DataFrame, day_factor: float) -> float:
+    return pos.diff().abs().sum(axis=1).mean() / len(df_univ) * day_factor
 
 @task
 def calc_summary(
+    df_univ,
     pnls: Dict[str, Any],
     pos: Dict[str, Any],
     winTrades: int,
@@ -475,7 +551,7 @@ def calc_summary(
     res["sharpe"]  += sharpe,
 
     res["tvr"]  += calc_tvr(pos, day_factor),
-    res["tvr2"] += calc_tvr2(pos, day_factor),
+    res["tvr2"] += calc_tvr2(df_univ, pos, day_factor),
 
     res["start"] += pnl.index.min().strftime("%Y-%m-%d"),
     res["end"]   += pnl.index.max().strftime("%Y-%m-%d"),
@@ -486,6 +562,7 @@ def calc_summary(
 
 @flow(task_runner=ConcurrentTaskRunner(), flow_run_name="summary")
 def summary_flow(
+    df_univ,
     pnls: Dict[str, Any],
     positions: Dict[str, Any],
     winTrades: Dict[str, Any],
@@ -527,7 +604,7 @@ def summary_flow(
             lt  = lossTrades[alpha_id][param]
             wp  = winPnL[alpha_id][param]
             lp  = lossPnL[alpha_id][param]
-            fut = calc_summary.submit(pnl, pos, wt, lt, wp, lp, param, alpha_id, freq, start, end)
+            fut = calc_summary.submit(df_univ, pnl, pos, wt, lt, wp, lp, param, alpha_id, freq, start, end)
             summary_wait[alpha_id][param] = fut
 
     summary_by_aid = defaultdict(lambda: pd.DataFrame)
@@ -723,6 +800,7 @@ def plot_flow(pnls: Dict[str, Any], positions: Dict[str, Any], output: str):
 @flow(task_runner=ConcurrentTaskRunner(), flow_run_name="sim")
 def sim_flow(data_dir: str,
              univ_file: str,
+             univ_by_mon_file: str,
              start: str,
              end: str,
              freq: str,
@@ -733,13 +811,18 @@ def sim_flow(data_dir: str,
     
     logger = get_run_logger()
     data = data_flow(data_dir, univ_file, start, end, freq)
-    signals = talib_flow(data, config)
-    positions = pos_flow(signals, delay=0)
+    # signals = talib_flow(data, config)
+    # signals = mvavg_flow(data, config)
+    signals = alpha101_flow(data, config)
+
+    df_univ_by_month = pd.read_csv(univ_by_mon_file)
+
+    positions = pos_flow(signals, df_univ_by_month, delay=0)
     slippage = slip_flow(data, positions, slip)
     pnls = pnl_flow(data, positions, slippage)
     trades = trade_flow(pnls, positions)
     winTrades, lossTrades, winPnL, lossPnL, tradesBySymbol, pnlBySymbol, tradesByMonth, pnlByMonth = count_trades_flow(trades)
-    summaries, summary_by_aid = summary_flow(pnls, positions, winTrades, lossTrades, winPnL, lossPnL, freq, start, end, output)
+    summaries, summary_by_aid = summary_flow(df_univ_by_month, pnls, positions, winTrades, lossTrades, winPnL, lossPnL, freq, start, end, output)
     detail_flow(summaries, pnls, positions, trades, tradesBySymbol, pnlBySymbol, tradesByMonth, pnlByMonth, output)
     plot_flow(pnls, positions, output)
 
@@ -755,10 +838,11 @@ if __name__ == "__main__":
         summaries, summary_by_aid  = sim_flow(
         data_dir="/Users/chenxu/Work/Crypto/spot/monthly/klines",
         univ_file="univ.csv",
+        univ_by_mon_file="univ_by_month.csv",
         start="2017-01-01", 
-        end="2023-01-01", 
-        freq="15T",
+        end="2023-04-01", 
+        freq="1H",
         exec="close",
-        slip=1e-4,
-        config="talib.json",
-        output="Test")
+        slip=5e-4,
+        config="alpha101.json",
+        output="Alpha101_Results")
