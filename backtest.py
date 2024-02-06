@@ -811,9 +811,9 @@ def sim_flow(data_dir: str,
     
     logger = get_run_logger()
     data = data_flow(data_dir, univ_file, start, end, freq)
-    # signals = talib_flow(data, config)
+    signals = talib_flow(data, config)
     # signals = mvavg_flow(data, config)
-    signals = alpha101_flow(data, config)
+    # signals = alpha101_flow(data, config)
 
     df_univ_by_month = pd.read_csv(univ_by_mon_file)
 
@@ -839,10 +839,10 @@ if __name__ == "__main__":
         data_dir="/Users/chenxu/Work/Crypto/spot/monthly/klines",
         univ_file="univ.csv",
         univ_by_mon_file="univ_by_month.csv",
-        start="2017-01-01", 
-        end="2023-04-01", 
-        freq="1H",
+        start="2022-01-01", 
+        end="2023-12-01", 
+        freq="15T",
         exec="close",
         slip=5e-4,
-        config="alpha101.json",
-        output="Alpha101_Results")
+        config="talib_select.json",
+        output="BTC_TaLib")
